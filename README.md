@@ -9,6 +9,33 @@ When developing or packaging, note that this app needs to be signed with the sam
 key as the main Termux app for permissions to work (only the main Termux app are
 allowed to call the API methods in this app).
 
+## Accessibility fork
+
+The `accessibility` branch builds on upstream PR #840 and adds swipe gestures.
+Pair it with the [`accessibility` CLI branch](https://github.com/anatoli-tsinovoy/termux-api-package/tree/accessibility).
+Build using JDK 17 and Android SDK 35 with `./gradlew assembleDebug`, or download
+the artifact from this fork's GitHub Action Build workflow. The debug APK uses
+the public GitHub test key; update only an installation with a matching signer.
+Do not uninstall Termux to bypass a signing mismatch without an external backup.
+
+Enable Termux:API manually in Android Settings → Accessibility. This grants broad
+cross-app access to window text, screenshots, text entry, gestures, and system
+actions. Disable the service in the same settings when not needed. Android 11+
+is the practical requirement for the current display/screenshot implementation.
+
+```sh
+termux-accessibility list-displays
+termux-accessibility dump [display-id]
+termux-accessibility click x y [display-id] [duration-ms]
+termux-accessibility swipe x1 y1 x2 y2 [display-id] [duration-ms]
+```
+
+Display defaults to 0; click duration defaults to 1 ms and swipe to 300 ms.
+Click/swipe return JSON with `success: true` only after Android reports completion;
+disabled service, invalid input, rejected/cancelled gestures, and timeouts return
+`success: false` with an `error`. Completion confirms Android's gesture callback,
+not that a particular UI control acted: inspect the UI afterward.
+
 ## Installation
 
 Latest version is `v0.53.0`.

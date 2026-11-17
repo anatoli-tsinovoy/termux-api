@@ -54,6 +54,10 @@ import java.lang.reflect.Field;
 import android.hardware.display.DisplayManager;
 import android.util.JsonWriter;
 import com.termux.api.util.ResultReturner.ResultJsonWriter;
+import android.os.Handler;
+import android.os.Looper;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import android.graphics.Point;
 
 import android.content.pm.PackageManager;
@@ -82,18 +86,47 @@ public class AccessibilityAPI {
 		int displayId = intent.getIntExtra("display-id", Display.DEFAULT_DISPLAY);
 
 		if (intent.hasExtra("dump")) {
-			dump(apiReceiver, intent, displayId);
+            TermuxAccessibilityService service = getEnabledAccessibilityService(context);
+            if (service == null) {
+                returnActionResult(apiReceiver, intent, false, "Accessibility service is disabled");
+            } else {
+                dump(apiReceiver, intent, displayId, service);
+            }
 		} else if (intent.hasExtra("click")) {
-			click(intent.getIntExtra("x", 0), intent.getIntExtra("y", 0), intent.getIntExtra("duration", 1), displayId);
-			returnEmptyString(apiReceiver, intent);
+            dispatchGesture(apiReceiver, context, intent, false,
+                    intent.hasExtra("x"), intent.getIntExtra("x", 0),
+                    intent.hasExtra("y"), intent.getIntExtra("y", 0), 0, 0,
+                    displayId, intent.getIntExtra("duration", 1));
+        } else if (intent.hasExtra("swipe")) {
+            dispatchGesture(apiReceiver, context, intent, true,
+                    intent.hasExtra("x1"), intent.getIntExtra("x1", 0),
+                    intent.hasExtra("y1"), intent.getIntExtra("y1", 0),
+                    intent.hasExtra("x2") ? intent.getIntExtra("x2", 0) : 0,
+                    intent.hasExtra("y2") ? intent.getIntExtra("y2", 0) : 0,
+                    displayId, intent.getIntExtra("duration", 300));
 		} else if (intent.hasExtra("type")) {
-			type(intent.getStringExtra("type"));
-			returnEmptyString(apiReceiver, intent);
+            TermuxAccessibilityService service = getEnabledAccessibilityService(context);
+            if (service == null) {
+                returnActionResult(apiReceiver, intent, false, "Accessibility service is disabled");
+            } else {
+                type(service, intent.getStringExtra("type"));
+                returnEmptyString(apiReceiver, intent);
+            }
 		} else if (intent.hasExtra("global-action")) {
-			performGlobalAction(intent.getStringExtra("global-action"));
-			returnEmptyString(apiReceiver, intent);
+            TermuxAccessibilityService service = getEnabledAccessibilityService(context);
+            if (service == null) {
+                returnActionResult(apiReceiver, intent, false, "Accessibility service is disabled");
+            } else {
+                performGlobalAction(service, intent.getStringExtra("global-action"));
+                returnEmptyString(apiReceiver, intent);
+            }
 		} else if (intent.hasExtra("screenshot")) {
-			screenshot(apiReceiver, context, intent, displayId);
+            TermuxAccessibilityService service = getEnabledAccessibilityService(context);
+            if (service == null) {
+                returnActionResult(apiReceiver, intent, false, "Accessibility service is disabled");
+            } else {
+			    screenshot(apiReceiver, context, intent, displayId, service);
+            }
 		} else if (intent.hasExtra("list-displays")) {
 			ResultReturner.returnData(apiReceiver, intent, new ResultJsonWriter() {
 				@Override
@@ -157,6 +190,8 @@ public class AccessibilityAPI {
     // [The Stack Overflow answer 14923144](https://stackoverflow.com/a/14923144)
     public static boolean isAccessibilityServiceEnabled(Context context, Class<? extends AccessibilityService> service) {
         AccessibilityManager am = (AccessibilityManager) context.getSystemService(Context.ACCESSIBILITY_SERVICE);
+        if (am == null)
+            return false;
         List<AccessibilityServiceInfo> enabledServices = am.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK);
 
         for (AccessibilityServiceInfo enabledService : enabledServices) {
@@ -168,24 +203,165 @@ public class AccessibilityAPI {
         return false;
     }
 
-    private static void click(int x, int y, int millisecondsDuration, int displayId) {
-        Path swipePath = new Path();
-        swipePath.moveTo(x, y);
-        GestureDescription.Builder gestureBuilder = new GestureDescription.Builder();
-		gestureBuilder.setDisplayId(displayId);
-        gestureBuilder.addStroke(new GestureDescription.StrokeDescription(swipePath, 0, millisecondsDuration));
-        TermuxAccessibilityService.instance.dispatchGesture(gestureBuilder.build(), null, null);
+    private static TermuxAccessibilityService getEnabledAccessibilityService(Context context) {
+        if (!isAccessibilityServiceEnabled(context, TermuxAccessibilityService.class))
+            return null;
+        return TermuxAccessibilityService.instance;
+    }
+
+    private static void returnActionResult(TermuxApiReceiver apiReceiver, Intent intent, boolean success, String error) {
+        ResultReturner.returnData(apiReceiver, intent, new ResultJsonWriter() {
+            @Override
+            public void writeJson(JsonWriter out) throws Exception {
+                out.beginObject();
+                out.name("success").value(success);
+                if (error != null)
+                    out.name("error").value(error);
+                out.endObject();
+            }
+        });
+    }
+
+    private static String validateGesture(Context context, int x1, int y1, int x2, int y2,
+                                         boolean swipe, int displayId, int duration) {
+        if (duration < 1 || duration > 60000)
+            return "Duration must be between 1 and 60000 milliseconds";
+        if (x1 < 0 || y1 < 0 || (swipe && (x2 < 0 || y2 < 0)))
+            return "Coordinates must not be negative";
+
+        DisplayManager displayManager = (DisplayManager) context.getSystemService(Context.DISPLAY_SERVICE);
+        Display display = displayManager == null ? null : displayManager.getDisplay(displayId);
+        if (display == null || !display.isValid())
+            return "Invalid display id: " + displayId;
+
+        Point displaySize = new Point();
+        display.getRealSize(displaySize);
+        if (x1 >= displaySize.x || y1 >= displaySize.y ||
+                (swipe && (x2 >= displaySize.x || y2 >= displaySize.y)))
+            return "Coordinates are outside the display bounds";
+        return null;
+    }
+
+    private static void dispatchGesture(TermuxApiReceiver apiReceiver, Context context, Intent intent,
+                                        boolean swipe, boolean hasX1, int x1, boolean hasY1, int y1,
+                                        int x2, int y2, int displayId, int duration) {
+        if (!hasX1 || !hasY1 || (swipe && (!intent.hasExtra("x2") || !intent.hasExtra("y2")))) {
+            returnActionResult(apiReceiver, intent, false, "Missing gesture coordinates");
+            return;
+        }
+
+        String validationError = validateGesture(context, x1, y1, x2, y2, swipe, displayId, duration);
+        if (validationError != null) {
+            returnActionResult(apiReceiver, intent, false, validationError);
+            return;
+        }
+        if (getEnabledAccessibilityService(context) == null) {
+            returnActionResult(apiReceiver, intent, false, "Accessibility service is disabled");
+            return;
+        }
+
+        Path path = new Path();
+        path.moveTo(x1, y1);
+        if (swipe)
+            path.lineTo(x2, y2);
+
+        GestureDescription gesture;
+        try {
+            GestureDescription.Builder gestureBuilder = new GestureDescription.Builder();
+            gestureBuilder.setDisplayId(displayId);
+            gestureBuilder.addStroke(new GestureDescription.StrokeDescription(path, 0, duration));
+            gesture = gestureBuilder.build();
+        } catch (RuntimeException e) {
+            returnActionResult(apiReceiver, intent, false, "Invalid gesture: " + e.getMessage());
+            return;
+        }
+
+        GestureResponse response = new GestureResponse(duration + 5000L);
+        Handler mainHandler = new Handler(Looper.getMainLooper());
+        ResultReturner.returnData(apiReceiver, intent, new ResultJsonWriter() {
+            @Override
+            public void writeJson(JsonWriter out) throws Exception {
+                response.writeJson(out);
+            }
+        });
+        if (!mainHandler.post(() -> {
+            TermuxAccessibilityService service = getEnabledAccessibilityService(context);
+            if (service == null) {
+                response.complete(false, "Accessibility service is disabled");
+                return;
+            }
+            try {
+                boolean accepted = service.dispatchGesture(gesture,
+                        new AccessibilityService.GestureResultCallback() {
+                            @Override
+                            public void onCompleted(GestureDescription completedGesture) {
+                                response.complete(true, null);
+                            }
+
+                            @Override
+                            public void onCancelled(GestureDescription cancelledGesture) {
+                                response.complete(false, "Gesture was cancelled");
+                            }
+                        }, mainHandler);
+                if (!accepted)
+                    response.complete(false, "Gesture dispatch was rejected");
+            } catch (RuntimeException e) {
+                String message = e.getMessage();
+                response.complete(false, message == null ? "Gesture dispatch failed" :
+                        "Gesture dispatch failed: " + message);
+            }
+        })) {
+            response.complete(false, "Unable to dispatch gesture on the main thread");
+        }
+    }
+
+    private static final class GestureResponse {
+        private final CountDownLatch completed = new CountDownLatch(1);
+        private boolean resolved;
+        private final long timeoutMillis;
+        private boolean success;
+        private String error;
+
+        private GestureResponse(long timeoutMillis) {
+            this.timeoutMillis = timeoutMillis;
+        }
+        private synchronized void complete(boolean success, String error) {
+            if (!resolved) {
+                resolved = true;
+                this.success = success;
+                this.error = error;
+                completed.countDown();
+            }
+        }
+
+        private void writeJson(JsonWriter out) throws IOException {
+            try {
+                if (!completed.await(timeoutMillis, TimeUnit.MILLISECONDS))
+                    complete(false, "Gesture completion timed out");
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                out.beginObject().name("success").value(false)
+                        .name("error").value("Interrupted while waiting for gesture result").endObject();
+                return;
+            }
+            out.beginObject().name("success").value(success);
+            if (error != null)
+                out.name("error").value(error);
+            out.endObject();
+        }
     }
 
     // The aim of this function is to give a compatible output with `adb` `uiautomator dump`.
-    private static void dump(TermuxApiReceiver apiReceiver, Intent intent, int displayId) {
-        SparseArray<List<AccessibilityWindowInfo>> windowsOnAllDisplays = TermuxAccessibilityService.instance.getWindowsOnAllDisplays();
+    private static void dump(TermuxApiReceiver apiReceiver, Intent intent, int displayId,
+                            TermuxAccessibilityService service) {
+        SparseArray<List<AccessibilityWindowInfo>> windowsOnAllDisplays = service.getWindowsOnAllDisplays();
 		List<AccessibilityWindowInfo> windowsOnDisplay = windowsOnAllDisplays.get(displayId);
 		// https://codeberg.org/Benjamin_Loison/Voice_assistant/issues/114#issuecomment-22027078 shows such an occurrence
 		if (windowsOnDisplay == null) {
 			ResultReturner.returnData(apiReceiver, intent, out -> {});
             return;
-		}
+        }
+
         int windowId = intent.getIntExtra("window-id", windowsOnDisplay.size() - 1);
         AccessibilityNodeInfo node = windowsOnDisplay.get(windowId).getRoot();
 		// On Signal *App permissions* for instance
@@ -304,8 +480,8 @@ public class AccessibilityAPI {
         return charSequence != null ? charSequence.toString() : "";
     }
 
-    private static void type(String toType) {
-		SparseArray<List<AccessibilityWindowInfo>> windowsOnAllDisplays = TermuxAccessibilityService.instance.getWindowsOnAllDisplays();
+    private static void type(TermuxAccessibilityService service, String toType) {
+		SparseArray<List<AccessibilityWindowInfo>> windowsOnAllDisplays = service.getWindowsOnAllDisplays();
 		for(int windowsOnAllDisplayIndex = 0; windowsOnAllDisplayIndex < windowsOnAllDisplays.size(); windowsOnAllDisplayIndex++)
         {
             List<AccessibilityWindowInfo> windowsOnAllDisplay = windowsOnAllDisplays.valueAt(windowsOnAllDisplayIndex);
@@ -323,7 +499,7 @@ public class AccessibilityAPI {
 		}
     }
 
-    private static void performGlobalAction(String globalActionString) {
+    private static void performGlobalAction(TermuxAccessibilityService service, String globalActionString) {
 		String fieldName = "GLOBAL_ACTION_" + globalActionString.toUpperCase();
 		Field field = null;
 		try {
@@ -338,11 +514,12 @@ public class AccessibilityAPI {
 			Logger.logDebug(LOG_TAG, "IllegalAccessException");
 		}
 		int globalActionInt = (int)globalActionObject;
-        TermuxAccessibilityService.instance.performGlobalAction(globalActionInt);
+        service.performGlobalAction(globalActionInt);
     }
 
-	private static void screenshot(TermuxApiReceiver apiReceiver, final Context context, Intent intent, int displayId) {
-		TermuxAccessibilityService.instance.takeScreenshot(
+	private static void screenshot(TermuxApiReceiver apiReceiver, final Context context, Intent intent,
+                                   int displayId, TermuxAccessibilityService service) {
+		service.takeScreenshot(
             displayId,
             context.getMainExecutor(),
             new TakeScreenshotCallback() {
